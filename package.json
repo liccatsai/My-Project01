@@ -1,0 +1,13 @@
+{
+  "name": "meeting-automation",
+  "version": "1.0.0",
+  "description": "自動化會議記錄寫入 Notion",
+  "main": "process-meeting.js",
+  "scripts": {
+    "process": "node process-meeting.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.12",
+    "dotenv": "^16.3.1"
+  }
+}
