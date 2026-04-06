@@ -34,7 +34,7 @@ $filterBody = @"
             "select": { "equals": "已完成" }
           },
           {
-            "property": "更新日期",
+            "property": "上次編輯時間",
             "date": {
               "on_or_after": "$twoDaysAgo"
             }
@@ -65,9 +65,13 @@ Remove-Item $tmpResponse -ErrorAction SilentlyContinue
 $tasks = $data.results
 Write-Host "取得 $($tasks.Count) 筆任務"
 
-$sections = @('版本開發','跨部門協作','待確認事項','阻礙','需老闆決策')
-$p26 = @{}; $p99 = @{}
-foreach ($s in $sections) { $p26[$s] = @(); $p99[$s] = @() }
+$statusOrder = @('進行中', '追蹤中', '待確認', '阻礙', '已完成')
+$p26 = @{}; $p99 = @{}; $pOther = @{}
+foreach ($s in $statusOrder) {
+    $p26[$s] = @()
+    $p99[$s] = @()
+    $pOther[$s] = @()
+}
 
 # 去重集合
 $seenLines = @{}
@@ -76,12 +80,11 @@ foreach ($t in $tasks) {
     $name   = $t.properties.'任務名稱'.title[0].plain_text
     $proj   = $t.properties.'專案'.select.name
     $status = $t.properties.'狀態'.select.name
-    $type   = $t.properties.'類型'.select.name
-    $note   = $t.properties.'備註/阻礙說明'.rich_text[0].plain_text
-    $desc   = $t.properties.'說明'.rich_text[0].plain_text
+    $note   = if ($t.properties.'備註/阻礙說明'.rich_text) { $t.properties.'備註/阻礙說明'.rich_text[0].plain_text } else { '' }
+    $responsible = if ($t.properties.'負責對象'.multi_select) { $t.properties.'負責對象'.multi_select.name } else { @() }
 
-    # 優先讀取說明欄；新規範建議所有進度存在事件紀錄表格內，此欄改為選填備註用
-    $summary = if ($desc) { $desc } elseif ($note) { $note } else { $status }
+    # 進度摘要來自備註欄
+    $summary = if ($note) { $note } else { $status }
     if ($summary.Length -gt 60) { $summary = $summary.Substring(0, 60) + '...' }
     $line = "$name：$summary"
 
@@ -89,21 +92,23 @@ foreach ($t in $tasks) {
     if ($seenLines[$line]) { continue }
     $seenLines[$line] = $true
 
-    $bucket = if ($status -eq '阻礙') {
-        '阻礙'
-    } elseif ($status -eq '待確認') {
-        if ($note -match '老闆|Albert|albert') { '需老闆決策' } else { '待確認事項' }
-    } else {
-        switch ($type) {
-            '開發協作'   { '版本開發' }
-            '跨部門協作' { '跨部門協作' }
-            '風險/決策'  { '待確認事項' }
-            default      { '版本開發' }
-        }
-    }
+    # 判斷是否需要標紅（負責對象含老闆或Marlos）
+    $isRed = ($responsible -contains '老闆') -or ($responsible -contains 'Marlos')
 
-    if ($proj -eq '26便利') { $p26[$bucket] += $line }
-    elseif ($proj -eq '99便利') { $p99[$bucket] += $line }
+    # 建立任務物件，包含行文本和是否標紅
+    $item = @{ Line = $line; IsRed = $isRed }
+
+    # 按專案和狀態分組
+    if ($proj -eq '26便利') { $p26[$status] += $item }
+    elseif ($proj -eq '99便利') { $p99[$status] += $item }
+    else { $pOther[$status] += $item }
+
+    # Debug: 輸出第一個任務的信息
+    if ($name -eq '商標申請推進（法務）') {
+        Write-Host "DEBUG: Task '$name'" -ForegroundColor Cyan
+        Write-Host "  Line: '$line'" -ForegroundColor Cyan
+        Write-Host "  Item['Line']: '$($item['Line'])'" -ForegroundColor Cyan
+    }
 }
 
 # ── 排程提醒輔助（26便利固定節奏） ───────────────────────────────────────────
@@ -267,24 +272,43 @@ function Get-ScheduleLines([datetime]$d) {
 
 $reportDate = (Get-Date).AddDays(1).Date
 $today = $reportDate.ToString('yyyy/MM/dd')
+
+# 純文字版本（終端輸出）
 $lines = @()
 $lines += "$today 早會報告"
 $lines += ''
 $lines += '【26便利】'
-foreach ($s in $sections) {
+foreach ($s in $statusOrder) {
     if ($p26[$s].Count -gt 0) {
         $lines += $s
-        $n = 1; foreach ($item in $p26[$s]) { $lines += "$n. $item"; $n++ }
+        $n = 1; foreach ($item in $p26[$s]) { $lines += "$n. $($item.Line)"; $n++ }
         $lines += ''
     }
 }
 $lines += ''
 $lines += '【99便利】'
-foreach ($s in $sections) {
+foreach ($s in $statusOrder) {
     if ($p99[$s].Count -gt 0) {
         $lines += $s
-        $n = 1; foreach ($item in $p99[$s]) { $lines += "$n. $item"; $n++ }
+        $n = 1; foreach ($item in $p99[$s]) { $lines += "$n. $($item.Line)"; $n++ }
         $lines += ''
+    }
+}
+if ($pOther | Measure-Object | Select-Object -ExpandProperty Count) {
+    $hasOther = $false
+    foreach ($s in $statusOrder) {
+        if ($pOther[$s].Count -gt 0) { $hasOther = $true; break }
+    }
+    if ($hasOther) {
+        $lines += ''
+        $lines += '【其他】'
+        foreach ($s in $statusOrder) {
+            if ($pOther[$s].Count -gt 0) {
+                $lines += $s
+                $n = 1; foreach ($item in $pOther[$s]) { $lines += "$n. $($item.Line)"; $n++ }
+                $lines += ''
+            }
+        }
     }
 }
 
@@ -299,6 +323,73 @@ if ($schedLines.Count -gt 0) {
 $report = $lines -join "`n"
 Write-Host $report
 
+# HTML 版本（Email 用）
+$htmlLines = @()
+$htmlLines += "<b>$today 早會報告</b><br>"
+$htmlLines += '<br>'
+$htmlLines += "<b>【26便利】</b><br>"
+foreach ($s in $statusOrder) {
+    if ($p26[$s].Count -gt 0) {
+        $htmlLines += "<b>$s</b><br>"
+        $n = 1; foreach ($item in $p26[$s]) {
+            if ($item.IsRed) {
+                $htmlLines += "$n. <span style=`"color:red;font-weight:bold`">$($item.Line)</span><br>"
+            } else {
+                $htmlLines += "$n. $($item.Line)<br>"
+            }
+            $n++
+        }
+        $htmlLines += "<br>"
+    }
+}
+
+$htmlLines += "<b>【99便利】</b><br>"
+foreach ($s in $statusOrder) {
+    if ($p99[$s].Count -gt 0) {
+        $htmlLines += "<b>$s</b><br>"
+        $n = 1; foreach ($item in $p99[$s]) {
+            if ($item.IsRed) {
+                $htmlLines += "$n. <span style=`"color:red;font-weight:bold`">$($item.Line)</span><br>"
+            } else {
+                $htmlLines += "$n. $($item.Line)<br>"
+            }
+            $n++
+        }
+        $htmlLines += "<br>"
+    }
+}
+
+if ($pOther | Measure-Object | Select-Object -ExpandProperty Count) {
+    $hasOther = $false
+    foreach ($s in $statusOrder) {
+        if ($pOther[$s].Count -gt 0) { $hasOther = $true; break }
+    }
+    if ($hasOther) {
+        $htmlLines += "<b>【其他】</b><br>"
+        foreach ($s in $statusOrder) {
+            if ($pOther[$s].Count -gt 0) {
+                $htmlLines += "<b>$s</b><br>"
+                $n = 1; foreach ($item in $pOther[$s]) {
+                    if ($item.IsRed) {
+                        $htmlLines += "$n. <span style=`"color:red;font-weight:bold`">$($item.Line)</span><br>"
+                    } else {
+                        $htmlLines += "$n. $($item.Line)<br>"
+                    }
+                    $n++
+                }
+                $htmlLines += "<br>"
+            }
+        }
+    }
+}
+
+if ($schedLines.Count -gt 0) {
+    $htmlLines += "<b>【排程提醒】</b><br>"
+    foreach ($sl in $schedLines) { $htmlLines += "* $sl<br>" }
+}
+
+$reportHtml = $htmlLines -join ""
+
 Write-Host '寄送 Email 中...'
 $subject = "$today 早會日報"
 
@@ -306,7 +397,8 @@ Send-MailMessage `
     -From $gmail `
     -To $gmail `
     -Subject $subject `
-    -Body $report `
+    -Body $reportHtml `
+    -BodyAsHtml `
     -Encoding UTF8 `
     -SmtpServer 'smtp.gmail.com' `
     -Port 587 `
@@ -318,30 +410,178 @@ Write-Host '日報已寄出！' -ForegroundColor Green
 # 寫入 Notion wiki
 Write-Host 'Writing to Notion...'
 
-function New-H1($t)  { @{ object='block'; type='heading_1'; heading_1=@{ rich_text=@(@{ type='text'; text=@{ content=$t } }) } } }
-function New-H2($t)  { @{ object='block'; type='heading_2'; heading_2=@{ rich_text=@(@{ type='text'; text=@{ content=$t } }) } } }
-function New-Num($t) { @{ object='block'; type='numbered_list_item'; numbered_list_item=@{ rich_text=@(@{ type='text'; text=@{ content=$t } }) } } }
+function New-H1($t) {
+    $h = [ordered]@{}
+    $h['object'] = 'block'
+    $h['type'] = 'heading_1'
+    $h['heading_1'] = @{
+        'rich_text' = @( @{
+            'type' = 'text'
+            'text' = @{ 'content' = [string]$t }
+        } )
+    }
+    $h
+}
+
+function New-H2($t) {
+    $h = [ordered]@{}
+    $h['object'] = 'block'
+    $h['type'] = 'heading_2'
+    $h['heading_2'] = @{
+        'rich_text' = @( @{
+            'type' = 'text'
+            'text' = @{ 'content' = [string]$t }
+        } )
+    }
+    $h
+}
+
+function New-Num([string]$content, [bool]$isRed = $false) {
+    $h = [ordered]@{}
+    $h['object'] = 'block'
+    $h['type'] = 'numbered_list_item'
+
+    $richItem = @{}
+    $richItem['type'] = 'text'
+    $richItem['text'] = @{ 'content' = $content }
+
+    if ($isRed) {
+        $richItem['annotations'] = @{
+            'bold' = $false
+            'italic' = $false
+            'strikethrough' = $false
+            'underline' = $false
+            'code' = $false
+            'color' = 'red'
+        }
+    }
+
+    $h['numbered_list_item'] = @{
+        'rich_text' = @( $richItem )
+    }
+    $h
+}
 
 $blocks = @()
 $blocks += New-H1('【26便利】')
-foreach ($s in $sections) {
+foreach ($s in $statusOrder) {
     if ($p26[$s].Count -gt 0) {
         $blocks += New-H2($s)
-        foreach ($item in $p26[$s]) { $blocks += New-Num($item) }
+        foreach ($item in $p26[$s]) {
+            # Debug: 只在進行中分類的第一項時輸出
+            if ($s -eq '進行中' -and ($blocks.Count -eq 2)) {
+                Write-Host "DEBUG Blocks Build:" -ForegroundColor Magenta
+                Write-Host "  item type: $($item.GetType().Name)" -ForegroundColor Magenta
+                Write-Host "  item value: $item" -ForegroundColor Magenta
+                if ($item -is [hashtable]) {
+                    Write-Host "  item['Line']: $($item['Line'])" -ForegroundColor Magenta
+                    Write-Host "  item.Line: $($item.Line)" -ForegroundColor Magenta
+                }
+            }
+
+            $cleanLine = [string]($item['Line'])
+            $isRed = [bool]($item['IsRed'])
+
+            # Debug: 輸出轉換後的 cleanLine (只在第一項)
+            if ($s -eq '進行中' -and ($blocks.Count -eq 2)) {
+                Write-Host "  cleanLine: '$cleanLine'" -ForegroundColor Magenta
+                Write-Host "  isRed: $isRed (type: $($isRed.GetType().Name))" -ForegroundColor Magenta
+            }
+
+            $blocks += New-Num($cleanLine, $isRed)
+        }
     }
 }
 $blocks += New-H1('【99便利】')
-foreach ($s in $sections) {
+foreach ($s in $statusOrder) {
     if ($p99[$s].Count -gt 0) {
         $blocks += New-H2($s)
-        foreach ($item in $p99[$s]) { $blocks += New-Num($item) }
+        foreach ($item in $p99[$s]) {
+            $cleanLine = [string]($item['Line'])
+            $isRed = [bool]($item['IsRed'])
+            $blocks += New-Num($cleanLine, $isRed)
+        }
+    }
+}
+if ($pOther | Measure-Object | Select-Object -ExpandProperty Count) {
+    $hasOther = $false
+    foreach ($s in $statusOrder) {
+        if ($pOther[$s].Count -gt 0) { $hasOther = $true; break }
+    }
+    if ($hasOther) {
+        $blocks += New-H1('【其他】')
+        foreach ($s in $statusOrder) {
+            if ($pOther[$s].Count -gt 0) {
+                $blocks += New-H2($s)
+                foreach ($item in $pOther[$s]) {
+                    $cleanLine = [string]($item['Line'])
+                    $isRed = [bool]($item['IsRed'])
+                    $blocks += New-Num($cleanLine, $isRed)
+                }
+            }
+        }
     }
 }
 
 # Notion 排程提醒區塊
 if ($schedLines.Count -gt 0) {
     $blocks += New-H1('【排程提醒】')
-    foreach ($sl in $schedLines) { $blocks += New-Num($sl) }
+    foreach ($sl in $schedLines) { $blocks += New-Num($sl, $false) }
+}
+
+# 改用 Notion blocks 而不是 markdown，直接產生正確的格式
+$blocks = @()
+
+# 【26便利】
+$blocks += @{ object = 'block'; type = 'heading_1'; heading_1 = @{ rich_text = @(@{ type = 'text'; text = @{ content = '【26便利】' } }) } }
+foreach ($s in $statusOrder) {
+    if ($p26[$s].Count -gt 0) {
+        $blocks += @{ object = 'block'; type = 'heading_2'; heading_2 = @{ rich_text = @(@{ type = 'text'; text = @{ content = $s } }) } }
+        $itemList = @()
+        $n = 1
+        foreach ($item in $p26[$s]) {
+            $lineText = "$n. "
+            if ($item.IsRed) {
+                $lineText += "🔴 "
+            }
+            $lineText += $item.Line
+            $itemList += $lineText
+            $n++
+        }
+        foreach ($line in $itemList) {
+            $blocks += @{ object = 'block'; type = 'paragraph'; paragraph = @{ rich_text = @(@{ type = 'text'; text = @{ content = $line } }) } }
+        }
+    }
+}
+
+# 【99便利】
+$blocks += @{ object = 'block'; type = 'heading_1'; heading_1 = @{ rich_text = @(@{ type = 'text'; text = @{ content = '【99便利】' } }) } }
+foreach ($s in $statusOrder) {
+    if ($p99[$s].Count -gt 0) {
+        $blocks += @{ object = 'block'; type = 'heading_2'; heading_2 = @{ rich_text = @(@{ type = 'text'; text = @{ content = $s } }) } }
+        $itemList = @()
+        $n = 1
+        foreach ($item in $p99[$s]) {
+            $lineText = "$n. "
+            if ($item.IsRed) {
+                $lineText += "🔴 "
+            }
+            $lineText += $item.Line
+            $itemList += $lineText
+            $n++
+        }
+        foreach ($line in $itemList) {
+            $blocks += @{ object = 'block'; type = 'paragraph'; paragraph = @{ rich_text = @(@{ type = 'text'; text = @{ content = $line } }) } }
+        }
+    }
+}
+
+# 【排程提醒】
+if ($schedLines.Count -gt 0) {
+    $blocks += @{ object = 'block'; type = 'heading_1'; heading_1 = @{ rich_text = @(@{ type = 'text'; text = @{ content = '【排程提醒】' } }) } }
+    foreach ($sl in $schedLines) {
+        $blocks += @{ object = 'block'; type = 'paragraph'; paragraph = @{ rich_text = @(@{ type = 'text'; text = @{ content = "* $sl" } }) } }
+    }
 }
 
 $notionPage = @{
@@ -355,6 +595,13 @@ $notionPage = @{
 $tmpNotion = Join-Path $PSScriptRoot '.tmp_notion.json'
 [System.IO.File]::WriteAllText($tmpNotion, $notionPage, [System.Text.Encoding]::UTF8)
 
+# Debug: 輸出原始任務物件和轉換後的 JSON
+Write-Host "DEBUG: Raw blocks[2]:" -ForegroundColor Yellow
+$blocks[2] | Format-List | Out-String | Write-Host
+
+Write-Host "DEBUG: First task block content:" -ForegroundColor Yellow
+$blocks[2] | ConvertTo-Json -Depth 10 | Write-Host
+
 $notionResult = Join-Path $PSScriptRoot '.tmp_notion_result.json'
 curl.exe -s -X POST 'https://api.notion.com/v1/pages' `
     -H "Authorization: Bearer $notionToken" `
@@ -365,10 +612,15 @@ curl.exe -s -X POST 'https://api.notion.com/v1/pages' `
 
 Remove-Item $tmpNotion -ErrorAction SilentlyContinue
 $nr = [System.IO.File]::ReadAllText($notionResult, [System.Text.Encoding]::UTF8)
-Remove-Item $notionResult -ErrorAction SilentlyContinue
 
-if ($nr -match '"url":"(https://www\.notion\.so/[^"]+)"') {
+if ($nr -match '"object":"error"') {
+    Write-Host '【Notion API 錯誤】' -ForegroundColor Red
+    Write-Host $nr
+} elseif ($nr -match '"url":"(https://www\.notion\.so/[^"]+)"') {
     Write-Host "已寫入 Notion：$($matches[1])" -ForegroundColor Green
 } else {
-    Write-Host '寫入 Notion 失敗' -ForegroundColor Red
+    Write-Host '寫入 Notion 失敗 - 無法解析回應' -ForegroundColor Red
+    Write-Host $nr
 }
+
+Remove-Item $notionResult -ErrorAction SilentlyContinue
