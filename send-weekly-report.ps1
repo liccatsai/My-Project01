@@ -56,6 +56,9 @@ $next26 = @(); $next99 = @()
 $risks = @()
 
 foreach ($t in $tasks) {
+    $needsReport = $t.properties.'需匯報'.checkbox
+    if (-not $needsReport) { continue }
+
     $name    = $t.properties.'任務名稱'.title[0].plain_text
     $proj    = $t.properties.'專案'.select.name
     $status  = $t.properties.'狀態'.select.name

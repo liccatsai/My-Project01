@@ -22,22 +22,30 @@ $today = (Get-Date).ToString('yyyy-MM-dd')
 $filterBody = @"
 {
   "filter": {
-    "or": [
+    "and": [
       {
-        "property": "狀態",
-        "select": { "does_not_equal": "已完成" }
+        "property": "需匯報",
+        "checkbox": { "equals": true }
       },
       {
-        "and": [
+        "or": [
           {
             "property": "狀態",
-            "select": { "equals": "已完成" }
+            "select": { "does_not_equal": "已完成" }
           },
           {
-            "property": "上次編輯時間",
-            "date": {
-              "on_or_after": "$twoDaysAgo"
-            }
+            "and": [
+              {
+                "property": "狀態",
+                "select": { "equals": "已完成" }
+              },
+              {
+                "property": "上次編輯時間",
+                "date": {
+                  "on_or_after": "$twoDaysAgo"
+                }
+              }
+            ]
           }
         ]
       }
